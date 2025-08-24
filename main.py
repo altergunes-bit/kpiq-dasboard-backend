@@ -3,17 +3,17 @@ import os
 import time
 import hmac
 import hashlib
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse  # HTMLResponse no longer needed
+from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
 
-# Load .env from the same folder as this file (for local/dev)
+# .env aynı klasördeyse local/dev için yükle
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-app = FastAPI(title="KPIQ Dashboard Backend", version="0.3.0")
+app = FastAPI(title="KPIQ Dashboard Backend", version="0.4.0")
 
 # -------------- helpers --------------
 def sign(payload: str, secret: str) -> str:
@@ -29,6 +29,16 @@ def is_plan_enabled(plan: str) -> bool:
     enabled = os.getenv("ENABLED_PLANS", "").replace(" ", "").split(",")
     enabled = [p for p in enabled if p]
     return plan in enabled
+
+
+def with_qs(url: str, extra: dict) -> str:
+    """Merge current query string with `extra` and return new URL."""
+    if not url:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query))
+    q.update(extra)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 
 # -------------- health --------------
@@ -57,7 +67,10 @@ def sso_login(
         raise HTTPException(status_code=400, detail=f"Plan '{plan}' not enabled")
 
     # Where /auth/sso lives (currently the same backend, later could be dashboard app)
-    dashboard_base = os.getenv("KPIQ_DASHBOARD_DOMAIN", "https://dashboard.kpiq.info")
+    dashboard_base = os.getenv(
+        "KPIQ_DASHBOARD_DOMAIN",
+        "https://kpiq-dasboard-backend.onrender.com",  # sensible default: this service
+    )
 
     ts = int(time.time())
     payload = f"{email}|{shop}|{plan}|{ts}"
@@ -77,8 +90,8 @@ def auth_sso(
     sig: str,
 ):
     """
-    Verify SSO parameters on the backend. If valid, redirect the customer
-    straight back to the Shopify Dashboard page (no interstitial page).
+    Verify SSO parameters on the backend.
+    If valid, redirect the customer directly to the plan's report URL.
     """
     secret = os.getenv("KPIQ_SSO_SECRET")
     if not secret:
@@ -86,7 +99,12 @@ def auth_sso(
 
     # Timestamp check (e.g., 10 minutes tolerance)
     now = int(time.time())
-    if abs(now - int(ts)) > 600:
+    try:
+        ts_int = int(ts)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid timestamp")
+
+    if abs(now - ts_int) > 600:
         raise HTTPException(status_code=400, detail="Link expired")
 
     # Plan check
@@ -94,12 +112,27 @@ def auth_sso(
         raise HTTPException(status_code=400, detail=f"Plan '{plan}' not enabled")
 
     # Signature verification
-    payload = f"{email}|{shop}|{plan}|{ts}"
+    payload = f"{email}|{shop}|{plan}|{ts_int}"
     expected_sig = sign(payload, secret)
     if not hmac.compare_digest(expected_sig, sig):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # Success -> redirect to Shopify dashboard URL (e.g. https://kpiq.info/pages/dashboard)
-    # 303 'See Other' ensures the client performs a GET to the target.
-    dashboard_url = os.getenv("KPIQ_SHOPIFY_DASHBOARD_URL", "/")
-    return RedirectResponse(url=dashboard_url, status_code=303)
+    # ---------- SUCCESS: send user to the correct report ----------
+    # URLs come from env; if missing, fall back to the Shopify dashboard.
+    starter_url = os.getenv("KPIQ_STARTER_REPORT_URL", "").strip()
+    premium_url = os.getenv("KPIQ_PREMIUM_REPORT_URL", "").strip()
+    dashboard_fallback = os.getenv("KPIQ_SHOPIFY_DASHBOARD_URL", "/").strip()
+
+    plan_target = {
+        "starter": starter_url or dashboard_fallback,
+        "premium": premium_url or dashboard_fallback,
+    }.get(plan, dashboard_fallback)
+
+    # If your report app expects the signed params, keep them; otherwise drop `with_qs`.
+    target = with_qs(
+        plan_target,
+        {"email": email, "shop": shop, "plan": plan, "ts": ts_int, "sig": expected_sig},
+    )
+
+    # 303 = See Other (forces GET on the target)
+    return RedirectResponse(url=target, status_code=303)
